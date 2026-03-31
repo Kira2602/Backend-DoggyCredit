@@ -1,0 +1,118 @@
+version: "3.9"
+
+services:
+  gateway:
+    image: nginx:latest
+    container_name: doggycredit-gateway
+    ports:
+      - "8080:80"
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - autenticacion-tenant
+      - integraciones
+      - perfil-financiero
+      - scoring-recomendador
+
+  autenticacion-tenant:
+    build: ./servicios/autenticacion-tenant
+    container_name: autenticacion-tenant
+    env_file:
+      - ./servicios/autenticacion-tenant/.env
+    ports:
+      - "5001:5000"
+    depends_on:
+      - auth-db
+
+  integraciones:
+    build: ./servicios/integraciones
+    container_name: integraciones
+    env_file:
+      - ./servicios/integraciones/.env
+    ports:
+      - "5002:5000"
+    depends_on:
+      - integraciones-db
+      - rabbitmq
+
+  perfil-financiero:
+    build: ./servicios/perfil-financiero
+    container_name: perfil-financiero
+    env_file:
+      - ./servicios/perfil-financiero/.env
+    ports:
+      - "5003:5000"
+    depends_on:
+      - perfil-db
+
+  scoring-recomendador:
+    build: ./servicios/scoring-recomendador
+    container_name: scoring-recomendador
+    env_file:
+      - ./servicios/scoring-recomendador/.env
+    ports:
+      - "5004:5000"
+    depends_on:
+      - scoring-db
+      - rabbitmq
+
+  auth-db:
+    image: postgres:16
+    container_name: auth-db
+    environment:
+      POSTGRES_DB: auth_tenant_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+
+  integraciones-db:
+    image: postgres:16
+    container_name: integraciones-db
+    environment:
+      POSTGRES_DB: integraciones_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - integraciones_db_data:/var/lib/postgresql/data
+
+  perfil-db:
+    image: postgres:16
+    container_name: perfil-db
+    environment:
+      POSTGRES_DB: perfil_financiero_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5435:5432"
+    volumes:
+      - perfil_db_data:/var/lib/postgresql/data
+
+  scoring-db:
+    image: postgres:16
+    container_name: scoring-db
+    environment:
+      POSTGRES_DB: scoring_recomendador_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5436:5432"
+    volumes:
+      - scoring_db_data:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+volumes:
+  auth_db_data:
+  integraciones_db_data:
+  perfil_db_data:
+  scoring_db_data:
