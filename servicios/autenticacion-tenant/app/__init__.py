@@ -1,8 +1,11 @@
 from flask import Flask
 from .config import Config
 from .extensions import db, migrate, cors
+from .models import Institucion, Rol, Usuario, UsuarioRol
 from .routes.health import health_bp
 from .routes.db_test import db_test_bp
+from .routes.usuarios import usuarios_bp
+from .routes.roles import roles_bp
 
 def create_app():
     app = Flask(__name__)
@@ -14,5 +17,7 @@ def create_app():
 
     app.register_blueprint(health_bp, url_prefix="/api")
     app.register_blueprint(db_test_bp, url_prefix="/api")
+    app.register_blueprint(usuarios_bp, url_prefix="/api")
+    app.register_blueprint(roles_bp, url_prefix="/api")
 
     return app
