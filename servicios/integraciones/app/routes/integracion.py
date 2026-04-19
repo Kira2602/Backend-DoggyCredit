@@ -7,6 +7,16 @@ from pymongo import MongoClient
 
 integracion_bp = Blueprint('integracion', __name__)
 
+
+MAPEO_BANCOS = {
+    "BANCO FREE": 1,
+    "BANCO PAGA": 2,
+    "Banco Solidario": 3,
+    "Banco Mercantil": 4,
+    "Banco Union": 5
+}
+
+
 # --- FUNCIONES DE APOYO ---
 
 def cargar_estado():
@@ -49,14 +59,31 @@ def cargar_datos_tienda(dias_relevancia=90):
     return tienda_dict
 
 # --- ENDPOINTS ---
+# --- ENDPOINTS ---
 
 @integracion_bp.route('/sincronizar-lote', methods=['POST'])
 def sincronizar_lote():
     client = None
     try:
-        # 1. Cargar estado y calcular el número de lote actual
+        body = request.get_json() or {}
+        
+        # 1. Ahora extraemos el nombre del banco
+        nombre_banco = body.get('nombre_banco')
+
+        if not nombre_banco:
+            return jsonify({"error": "Falta el 'nombre_banco' en el cuerpo de la petición"}), 400
+
+        # 2. Buscamos el ID interno usando el diccionario
+        id_banco = MAPEO_BANCOS.get(nombre_banco)
+        
+        # Si envían un banco que no está en la lista, rechazamos la petición
+        if not id_banco:
+            return jsonify({"error": f"El banco '{nombre_banco}' no está registrado en el sistema"}), 404
+
+        # --- A partir de aquí, la lógica sigue usando id_banco como antes ---
         estado = cargar_estado()
-        offset = estado.get("offset_banco", 0)
+        clave_offset = f"offset_banco_{id_banco}"
+        offset = estado.get(clave_offset, 0)
         nro_lote_actual = calcular_nro_lote(offset)
         limit = 10
 
@@ -65,42 +92,56 @@ def sincronizar_lote():
         coleccion = db.perfiles_centralizados
 
         tienda_data = cargar_datos_tienda(dias_relevancia=30)
-        path_banco = os.path.join(current_app.root_path, '..', 'data', 'dataset_bancario.csv')
+        
+        nombre_archivo = f'dataset_banco{id_banco}.csv'
+        path_banco = os.path.join(current_app.root_path, '..', 'data', nombre_archivo)
         
         if not os.path.exists(path_banco):
-            return jsonify({"error": "Archivo bancario no encontrado"}), 404
+            return jsonify({"error": f"Archivo {nombre_archivo} no encontrado"}), 404
 
         with open(path_banco, mode='r', encoding='utf-8') as file:
-            reader = list(csv.DictReader(file))
+            primera_linea = file.readline()
+            delimitador = ';' if ';' in primera_linea else ','
+            file.seek(0)
+            
+            reader = list(csv.DictReader(file, delimiter=delimitador, skipinitialspace=True))
 
         lote_csv = reader[offset:offset + limit]
+        
         if not lote_csv:
-            return jsonify({"status": "fin", "mensaje": "No hay más datos"}), 200
+            return jsonify({"status": "fin", "mensaje": f"No hay más datos para {nombre_banco}"}), 200
 
         perfiles_enriquecidos = []
 
         for row in lote_csv:
-            carnet_cliente = row.get('carnet')
-            if not carnet_cliente: continue
+            row_limpia = {str(k).strip(): v for k, v in row.items() if k is not None}
+            
+            carnet_cliente = row_limpia.get('carnet')
+            if carnet_cliente:
+                carnet_cliente = str(carnet_cliente).strip()
+                
+            if not carnet_cliente or carnet_cliente == "": 
+                continue
 
-            # Limpieza de Tienda
             historial_tienda = tienda_data.get(carnet_cliente, [])
             for item in historial_tienda:
                 item.pop('carnet', None)
                 item.pop('nombre_completo', None)
                 item.pop('customer_id', None)
 
-            # Limpieza de Banco
-            datos_banco_raw = dict(row)
+            datos_banco_raw = dict(row_limpia)
             nombre = datos_banco_raw.pop('nombre_completo', 'Sin Nombre')
-            entidad = datos_banco_raw.pop('nombre_banco', 'Entidad Desconocida')
+            
+            # 3. Usamos el nombre real del banco para guardarlo en la base de datos
+            entidad = nombre_banco 
             datos_banco_raw.pop('carnet', None)
 
             perfil_360 = {
                 "identidad": {
                     "nombre_completo": nombre,
                     "carnet": carnet_cliente,
-                    "entidad_origen": entidad
+                    "entidad_origen": entidad, # Guarda "Banco Free" en lugar de "Banco 1"
+                    "id_tenant": id_banco
                 },
                 "datos_banco_raw": datos_banco_raw,
                 "datos_tienda_raw": historial_tienda,
@@ -108,12 +149,11 @@ def sincronizar_lote():
                     "estado": "ingestado_crudo",
                     "fecha_sincronizacion": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     "num_interacciones_tienda": len(historial_tienda),
-                    "nro_lote": nro_lote_actual # Guardamos 1, 2, 3...
+                    "nro_lote": nro_lote_actual 
                 }
             }
             perfiles_enriquecidos.append(perfil_360)
 
-        # Guardado con Upsert
         for perfil in perfiles_enriquecidos:
             coleccion.update_one(
                 {"identidad.carnet": perfil['identidad']['carnet']},
@@ -121,14 +161,14 @@ def sincronizar_lote():
                 upsert=True
             )
 
-        # Actualizar offset para la siguiente ejecución
-        estado["offset_banco"] = offset + limit
+        estado[clave_offset] = offset + limit
         guardar_estado(estado)
 
         return jsonify({
             "status": "success",
-            "mensaje": f"Lote {nro_lote_actual} procesado con éxito",
-            "registros_procesados": len(perfiles_enriquecidos)
+            "mensaje": f"Lote {nro_lote_actual} de {nombre_banco} procesado con éxito",
+            "registros_procesados": len(perfiles_enriquecidos),
+            "registros": perfiles_enriquecidos
         }), 200
 
     except Exception as e:
@@ -139,25 +179,31 @@ def sincronizar_lote():
 @integracion_bp.route('/obtener-lote', methods=['GET'])
 def obtener_lote_db():
     """
-    Obtiene los registros de un lote específico (1, 2, 3...)
-    Uso: /obtener-lote?nro=1
+    Obtiene los registros de un lote específico para un banco específico.
+    Uso: /obtener-lote?id_banco=1&nro=1
     """
     client = None
     try:
-        # Por defecto intenta traer el lote anterior al actual si no se especifica
-        estado = cargar_estado()
-        offset_actual = estado.get("offset_banco", 0)
-        nro_lote_defecto = calcular_nro_lote(offset_actual) - 1
+        # --- SOLUCIÓN DEL GET: Leer el tenant correcto ---
+        id_banco = request.args.get('id_banco', default=1, type=int)
         
-        nro_a_buscar = request.args.get('nro', default=max(1, nro_lote_defecto), type=int)
+        estado = cargar_estado()
+        clave_offset = f"offset_banco_{id_banco}"
+        offset_actual = estado.get(clave_offset, 0)
+        nro_lote_defecto = max(1, calcular_nro_lote(offset_actual) - 1)
+        
+        nro_a_buscar = request.args.get('nro', default=nro_lote_defecto, type=int)
 
         client = MongoClient(current_app.config['MONGO_URI'])
         db = client[current_app.config['DB_NAME']]
         coleccion = db.perfiles_centralizados
 
-        # Buscamos por el campo nro_lote en la metadata
+        # Buscamos por nro_lote Y por id_tenant para no mezclar datos de distintos bancos
         registros = list(coleccion.find(
-            {"metadata.nro_lote": nro_a_buscar}
+            {
+                "metadata.nro_lote": nro_a_buscar,
+                "identidad.id_tenant": id_banco
+            }
         ))
 
         for r in registros:
@@ -165,6 +211,7 @@ def obtener_lote_db():
 
         return jsonify({
             "status": "success",
+            "banco": id_banco,
             "lote_nro": nro_a_buscar,
             "cantidad": len(registros),
             "registros": registros
