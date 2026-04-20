@@ -1,23 +1,53 @@
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 from ..extensions import db
-from ..models import PerfilCliente, DatosFinancieros, MetricasFinancieras, AnalisisNecesidades, AlertasCliente
+from ..models import PerfilCliente, DatosFinancieros, MetricasFinancieras, AnalisisNecesidades, AlertasCliente, Institucion
 import logging
 
 perfil_bp = Blueprint('perfil', __name__)
 logger = logging.getLogger(__name__)
+
+def obtener_institucion_id(nombre_banco):
+    """Obtiene el UUID del banco desde BD. Si no existe, crea uno nuevo."""
+    institucion = Institucion.query.filter_by(nombre_fintech=nombre_banco).first()
+    if institucion:
+        return institucion.id
+    
+    # Si no existe, crear nuevo
+    import uuid
+    nuevo_id = str(uuid.uuid4())
+    nueva_inst = Institucion(id=nuevo_id, nombre_fintech=nombre_banco)
+    db.session.add(nueva_inst)
+    db.session.flush()
+    return nuevo_id
 
 
 @perfil_bp.route('/clientes', methods=['GET'])
 def listar_clientes():
     """
     GET /api/clientes
-    Retorna lista de todos los clientes
+    GET /api/clientes?banco=NOMBRE_BANCO
+    
+    Retorna lista de clientes, opcionalmente filtrados por banco
     """
     try:
-        clientes = PerfilCliente.query.all()
+        banco_param = request.args.get('banco')
+        
+        # Si especifica banco, filtrar
+        if banco_param:
+            institucion = Institucion.query.filter_by(nombre_fintech=banco_param).first()
+            if not institucion:
+                return jsonify({'error': f'Banco "{banco_param}" no encontrado'}), 404
+            
+            clientes = PerfilCliente.query.filter_by(id_institucion=institucion.id).all()
+            nombre_banco = institucion.nombre_fintech
+        else:
+            # Si no especifica, retornar todos
+            clientes = PerfilCliente.query.all()
+            nombre_banco = 'Todos'
         
         resultado = {
             'total': len(clientes),
+            'banco': nombre_banco,
             'clientes': [
                 {
                     'documento_id': c.documento_id,
