@@ -1,97 +1,100 @@
-import logging
-from .models import Score, Recomendacion
-from ..extensions import db
-# Aquí importarías tu modelo entrenado (ejemplo con joblib)
-# import joblib
-# model = joblib.load('path_to_model/modelo_scoring_pago.pkl')
-
-logger = logging.getLogger(__name__)
+import joblib
+import os
+import pandas as pd
+from app.models import Score, Recomendacion
+from app.extensions import db
+from datetime import datetime
+# Es vital importar la definición para que joblib sepa qué es un CreditModel
+from model_definitions import CreditModel 
 
 class ScoringService:
+    MODEL_PATH = '/app/app/ai_models/modelo_credito.pkl'
+    _model = None
 
-    @staticmethod
-    def calcular_y_guardar(datos_perfil, tenant_plan_pago=False):
-        """
-        datos_perfil: Diccionario con la info de MetricasFinancieras y DatosFinancieros
-        tenant_plan_pago: Booleano que indica si la institución paga o no
-        """
-        try:
-            documento_id = datos_perfil.get('documento_id')
-            tenant_id = datos_perfil.get('id_institucion')
-            
-            # 1. Decidir qué tipo de Scoring aplicar
-            if not tenant_plan_pago:
-                # LÓGICA PLAN GRATUITO: Score básico basado en reglas
-                # Ejemplo: (Ratio Pago * 0.7 + Ratio Utilización * 0.3) * 1000
-                ratio_pago = float(datos_perfil.get('ratio_pago', 0))
-                ratio_util = float(datos_perfil.get('ratio_utilizacion', 0))
-                
-                score_final = (ratio_pago * 0.7 + (1 - ratio_util) * 0.3) * 1000
-                prob_default = None
-                nivel_riesgo = "N/A (Plan Básico)"
-                tipo_plan = False
+    @classmethod
+    def get_model(cls):
+        if cls._model is None:
+            if os.path.exists(cls.MODEL_PATH):
+                cls._model = joblib.load(cls.MODEL_PATH)
             else:
-                # LÓGICA PLAN PAGO: Inferencia con Modelo de IA
-                # Extraemos las 'features' para el modelo
-                features = [
-                    float(datos_perfil.get('ratio_utilizacion', 0)),
-                    float(datos_perfil.get('ratio_pago', 0)),
-                    float(datos_perfil.get('volatilidad_gastos', 0)),
-                    int(datos_perfil.get('tendencia_pagos', 0))
-                ]
-                
-                # Simulación de predicción del modelo (ML Inference)
-                # prob_default = model.predict_proba([features])[0][1]
-                prob_default = 0.15 # Ejemplo de salida del modelo
-                score_final = (1 - prob_default) * 1000
-                
-                if score_final > 700: nivel_riesgo = "Bajo"
-                elif score_final > 400: nivel_riesgo = "Medio"
-                else: nivel_riesgo = "Alto"
-                
-                tipo_plan = True
+                raise FileNotFoundError(f"Modelo no encontrado en {cls.MODEL_PATH}")
+        return cls._model
 
-            # 2. Guardar el Score en la BD
-            nuevo_score = Score(
-                documento_id=documento_id,
-                tenant_id=tenant_id,
-                scoring=score_final,
-                tipo_plan=tipo_plan,
-                probabilidad_default=prob_default,
-                nivel_riesgo=nivel_riesgo
-            )
-            db.session.add(nuevo_score)
-            db.session.flush() # Para obtener el ID del score antes del commit
-
-            # 3. Generar Recomendación Automática (Cerebro de IA)
-            ScoringService._generar_recomendaciones(nuevo_score, datos_perfil)
-
-            db.session.commit()
-            return nuevo_score
-
-        except Exception as e:
-            db.session.rollback()
-            logger.error(f"Error en el cálculo de scoring: {str(e)}")
-            raise e
+    # app/services/scoring_service.py
 
     @staticmethod
-    def _generar_recomendaciones(score_obj, datos_perfil):
-        """
-        Lógica interna para crear las recomendaciones basadas en el score y necesidades
-        """
-        necesidades = datos_perfil.get('necesidades', [])
+    def calcular_y_guardar(json_perfil, tenant_plan_pago=False):
+        model = ScoringService.get_model()
         
-        for n in necesidades:
-            etiqueta = n.get('etiqueta_interes')
+        if tenant_plan_pago:
+            res = model.predict(json_perfil)
             
-            # Lógica simple de recomendación:
-            # Si el score es alto y tiene interés en 'PYME', recomendamos con alta prob.
-            prob_afinidad = 0.9 if score_obj.scoring > 600 else 0.4
+            # --- CORRECCIÓN AQUÍ: Convertir de NumPy a Python native ---
+            scoring_val = float(res['scoring'])
+            prob_def_val = float(res['probabilidad_default'])
+            prob_afin_val = float(res['probabilidad_afinidad'])
+            categoria_val = str(res['categoria'])
+            # ---------------------------------------------------------
+
+            nuevo_score = Score(
+                tenant_id=json_perfil['cliente'].get('id_institucion'),
+                documento_id=json_perfil['cliente']['documento_id'],
+                scoring=scoring_val,
+                tipo_plan=True,
+                probabilidad_default=prob_def_val,
+                nivel_riesgo=res['nivel_riesgo']
+            )
             
+            db.session.add(nuevo_score)
+            db.session.flush()
+
             nueva_rec = Recomendacion(
-                score_id=score_obj.id,
-                categoria=etiqueta,
-                probabilidad=prob_afinidad,
-                insight_ia=f"Recomendado por afinidad en {etiqueta} y score de {score_obj.nivel_riesgo}"
+                score_id=nuevo_score.id,
+                categoria=str(res['categoria']), # Aseguramos que sea string
+                probabilidad_afinidad=prob_afin_val
             )
             db.session.add(nueva_rec)
+            
+        else:
+            # Lógica básica (ya suele ser float de Python)
+            score_base = float(json_perfil.get('metricas', {}).get('ratio_pago', 0) * 10)
+            nuevo_score = Score(
+                tenant_id=json_perfil['cliente'].get('id_institucion'),
+                documento_id=json_perfil['cliente']['documento_id'],
+                scoring=round(score_base, 2),
+                tipo_plan=False,
+                nivel_riesgo="medium" if score_base > 500 else "high"
+            )
+            db.session.add(nuevo_score)
+            nueva_rec = None
+
+        db.session.commit()
+        return nuevo_score, nueva_rec
+
+    @staticmethod
+    def _predecir_score(payload, es_plan_pago):
+        if es_plan_pago:
+            model = ScoringService.get_model()
+            # El DataFrame debe usar los nombres exactos que espera el v1.0.2
+            data_input = pd.DataFrame([{
+                'payment_ratio': payload.get('ratio_pago', 0),
+                'utilization_ratio': payload.get('ratio_utilizacion', 0),
+                'debt_cycle': payload.get('ciclo_deuda', 0),
+                'volatility': payload.get('volatilidad_gastos', 0),
+                'num_alerts': payload.get('total_alerts', 0),
+                'num_warnings': payload.get('total_warnings', 0),
+                'age': payload.get('edad', 0),
+                'avg_bill': payload.get('avg_bill', 0),
+                'avg_payment': payload.get('avg_payment', 0),
+                'payment_std': payload.get('volatilidad_gastos', 0),
+                'limit_bal': payload.get('limit_bal', 0)
+            }])
+
+            try:
+                prob_default = model.predict_proba(data_input)[0][1]
+                return round((1 - prob_default) * 1000, 2)
+            except Exception as e:
+                print(f"Error IA: {e}")
+                return round(payload.get('ratio_pago', 0) * 10, 2)
+        
+        return round(payload.get('ratio_pago', 0) * 10, 2)

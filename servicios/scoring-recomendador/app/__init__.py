@@ -2,6 +2,7 @@ from flask import Flask
 from .config import Config
 from .extensions import db, migrate, cors
 from .routes.health import health_bp
+from .routes.routes import scoring_bp
 
 def create_app():
     app = Flask(__name__)
@@ -12,5 +13,6 @@ def create_app():
     cors.init_app(app)
 
     app.register_blueprint(health_bp, url_prefix="/api")
+    app.register_blueprint(scoring_bp, url_prefix="/api/scoring")
 
     return app
